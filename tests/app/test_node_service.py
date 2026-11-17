@@ -9,7 +9,7 @@ import secrets
 import signal
 import ssl
 import stat
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -319,6 +319,152 @@ async def test_direct_video_tickets_scope_expiry_and_revocation(tmp_path):
         for peer in peers:
             await peer.close()
         await endpoint.close()
+
+
+@pytest.mark.asyncio
+async def test_viewers_request_keyframes_and_requests_coalesce(tmp_path, monkeypatch):
+    from telesurgery.nodes.video import VideoEndpoint
+    from telesurgery_core.diagnostics.clock import Clock
+    from telesurgery_core.transport.peer import Peer
+    from telesurgery_core.transport.protocol import VideoHeader
+    from telesurgery_core.transport.tls import client_context
+
+    # Long enough that the request right after attaching stays inside the window.
+    monkeypatch.setattr("telesurgery.nodes.video.KEYFRAME_COALESCE", 0.5)
+    endpoint = VideoEndpoint(tmp_path, Clock())
+    requested, peers = [], []
+    endpoint.refresh = requested.append
+
+    async def connect():
+        async def reject(*args):
+            raise PermissionError("No inbound commands")
+
+        async def event(*args):
+            pass
+
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", endpoint.address["port"], ssl=client_context()
+        )
+        peers.append(Peer(reader, writer, reject, event).start())
+        return peers[-1]
+
+    try:
+        await endpoint.start(0)
+        stranger, viewer = await connect(), await connect()
+        with pytest.raises(RuntimeError, match="single viewer ticket"):
+            await stranger.call("viewer.refresh", {})
+        assert requested == []
+        ticket = (await endpoint.control("video.ticket", {"camera": "one", "id": "node:one"}))[
+            "ticket"
+        ]
+        await viewer.call("viewer.attach", {"ticket": ticket})
+        assert requested == ["one"]  # A new viewer cannot decode deltas until an IDR.
+        await viewer.call("viewer.refresh", {})
+        assert requested == ["one"]  # Shares the IDR that was just requested.
+        endpoint.publish("one", asdict(VideoHeader(0, 1, 32, 32, gop=1)), b"idr", None)
+        await asyncio.sleep(0.6)
+        assert requested == ["one"]  # That IDR arrived, so the second request is met.
+        await viewer.call("viewer.refresh", {})
+        assert requested == ["one", "one"]
+        # A request inside the window with no IDR since is delayed, never dropped.
+        await viewer.call("viewer.refresh", {})
+        assert requested == ["one", "one"]
+        await asyncio.sleep(0.6)
+        assert requested == ["one", "one", "one"]
+    finally:
+        for peer in peers:
+            await peer.close()
+        await endpoint.close()
+
+
+@pytest.mark.asyncio
+async def test_a_viewer_that_falls_behind_keeps_decodable_frames_and_gets_an_idr(tmp_path):
+    from telesurgery.nodes.video import VideoEndpoint
+    from telesurgery_core.diagnostics.clock import Clock
+    from telesurgery_core.transport.peer import Peer
+    from telesurgery_core.transport.protocol import VideoHeader
+    from telesurgery_core.transport.tls import client_context
+
+    endpoint = VideoEndpoint(tmp_path, Clock())
+    requested, received = [], []
+    endpoint.refresh = requested.append
+
+    async def reject(*args):
+        raise PermissionError("No inbound commands")
+
+    async def event(peer, name, params, payload):
+        received.append((params["header"]["gop"], params["header"]["gop_index"]))
+
+    def frame(gop, index):
+        header = VideoHeader(gop * 100 + index, 1, 32, 32, keyframe=index == 0, gop=gop)
+        endpoint.publish("one", asdict(replace(header, gop_index=index)), b"frame", None)
+
+    await endpoint.start(0)
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", endpoint.address["port"], ssl=client_context()
+    )
+    viewer = Peer(reader, writer, reject, event).start()
+    try:
+        ticket = await endpoint.control("video.ticket", {"camera": "one", "id": "node:one"})
+        await viewer.call("viewer.attach", {"ticket": ticket["ticket"]})
+        frame(1, 0)
+        await until(lambda: received == [(1, 0)])
+        await asyncio.sleep(0.15)
+        requested.clear()
+        # Three frames arrive before the connection sends one: only the first still
+        # decodes, so the others are withheld and an IDR is requested at once.
+        frame(1, 1)
+        frame(1, 2)
+        frame(1, 3)
+        assert requested == ["one"]
+        await until(lambda: received[-1] == (1, 1))
+        frame(1, 4)  # Still waiting: no delta is sent until the IDR.
+        frame(2, 0)
+        frame(2, 1)  # The IDR is unsent, so this delta would be undecodable too.
+        await until(lambda: received[-1] == (2, 0))
+        assert received == [(1, 0), (1, 1), (2, 0)]
+        report = await endpoint.control("video.metrics", {"camera": "one"})
+        assert report["one"]["metrics"]["withheld_frames"]["count"] == 4
+        assert report["one"]["keyframes"] == 2
+        # A frame lost before the node reaches no viewer: its successors are held back.
+        await asyncio.sleep(0.15)
+        requested.clear()
+        frame(2, 3)
+        frame(2, 4)
+        assert requested == ["one"]
+        frame(3, 0)
+        await until(lambda: received[-1] == (3, 0))
+        assert received == [(1, 0), (1, 1), (2, 0), (3, 0)]
+        # Intra-only streams keep the previous behaviour: the newest frame replaces.
+        received.clear()
+        for index in range(3):
+            endpoint.publish("one", asdict(VideoHeader(900 + index, 1, 32, 32)), b"jpeg", None)
+        await until(lambda: received)
+        await asyncio.sleep(0.05)
+        assert len(received) == 1
+    finally:
+        await viewer.close()
+        await endpoint.close()
+
+
+@pytest.mark.asyncio
+async def test_node_signals_a_running_camera_worker_for_a_keyframe(tmp_path):
+    from telesurgery.nodes.local import LocalNode
+    from telesurgery_core.video.reference import KEYFRAME_SUFFIX
+
+    node = LocalNode(tmp_path, None)
+    settings = tmp_path / "camera.json"
+    try:
+        node.request_keyframe("missing")  # Unknown cameras are ignored.
+        node.workers["one"] = {"settings": settings}
+        node.request_keyframe("one")
+        assert settings.with_suffix(KEYFRAME_SUFFIX).exists()
+        settings.with_suffix(KEYFRAME_SUFFIX).unlink()
+        node.workers["one"]["error"] = "exited"
+        node.request_keyframe("one")
+        assert not settings.with_suffix(KEYFRAME_SUFFIX).exists()
+    finally:
+        node.temp.cleanup()
 
 
 @pytest.mark.asyncio

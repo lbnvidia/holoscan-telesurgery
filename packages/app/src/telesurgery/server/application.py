@@ -48,7 +48,7 @@ class Application:
         self.endpoint_host = endpoint_host
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.engine = Executor(role)
-        self.media = Media(self._media_changed)
+        self.media = Media(self._media_changed, lambda camera: self.streams.refresh(camera))
         self.access = Access(self.directory / "surgeons.yaml" if role == "patient" else None)
         self.native = NativeViews(self.directory / "viewers")
         self.controller = NativeController(self.directory / "controller")
@@ -491,10 +491,13 @@ class Application:
                             "modes",
                             "pixel_format",
                             "codec",
+                            "rate_control",
+                            "bitrate_mbps",
                             "qp",
                             "jpeg_quality",
                             "codecs",
                             "encoder_preset",
+                            "encoder_extra",
                             "receiver",
                             "receivers",
                             "depth",

@@ -4,6 +4,7 @@
 """Validate capture choices against a camera's advertised modes."""
 
 from telesurgery_core.video.config import Config
+from telesurgery_core.video.encoder_settings import parse_extra, validate
 from telesurgery_core.video.tokenizer_model import CODEC, token_shape
 
 DEFAULTS = {
@@ -14,9 +15,12 @@ DEFAULTS = {
         "fps",
         "pixel_format",
         "codec",
+        "rate_control",
+        "bitrate_mbps",
         "qp",
         "jpeg_quality",
         "encoder_preset",
+        "encoder_extra",
         "receiver",
         "depth",
     )
@@ -65,8 +69,8 @@ def select(camera, settings=None):
         raise ValueError("This node does not support the selected codec")
     if selected["codec"] == CODEC:
         token_shape(selected["width"], selected["height"])
-    if type(selected["qp"]) is not int or not 0 <= selected["qp"] <= 51:
-        raise ValueError("Quality (QP) must be an integer from 0 to 51")
+    validate(selected["rate_control"], selected["bitrate_mbps"], selected["qp"])
+    parse_extra(selected["encoder_extra"])
     if selected["encoder_preset"] not in ("P1", "P3", "P5"):
         raise ValueError("Choose a supported encoder speed")
     if type(selected["jpeg_quality"]) is not int or not 1 <= selected["jpeg_quality"] <= 100:

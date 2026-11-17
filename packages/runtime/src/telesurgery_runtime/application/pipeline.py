@@ -3,6 +3,7 @@
 
 """Bounded application calls executed by real Holoscan graphs."""
 
+from collections import deque
 from concurrent.futures import Future, InvalidStateError
 from queue import Empty, Full, Queue
 from threading import Lock
@@ -130,45 +131,78 @@ class Executor:
 
 
 class Frames:
-    def __init__(self):
-        self.pending = {}
+    """Encoded frames per camera, in arrival order.
+
+    A predicted frame is only useful after the one before it, so a short backlog
+    stays in order. A keyframe replaces whatever is waiting, which keeps only the
+    newest frame of an intra-only stream. A camera that falls ``backlog`` frames
+    behind drops them; the receiver then recovers with an IDR.
+    """
+
+    def __init__(self, backlog=8):
+        self.pending, self.backlog = {}, backlog
         self.lock = Lock()
 
-    def put(self, key, value):
+    def put(self, key, value, keyframe=True):
         with self.lock:
-            self.pending[key] = value
+            queue = self.pending.setdefault(key, deque())
+            if keyframe or len(queue) >= self.backlog:
+                queue.clear()
+            queue.append(value)
 
     def compute(self):
         with self.lock:
-            if not self.pending:
+            key = next((key for key, queue in self.pending.items() if queue), None)
+            if key is None:
                 return None
-            key = next(iter(self.pending))
-            return self.pending.pop(key)
+            queue = self.pending.pop(key)
+            self.pending[key] = queue  # Cameras take turns.
+            return queue.popleft()
+
+    @property
+    def wake(self):
+        """A source stage that signals waiting frames without removing them."""
+        frames = self
+
+        class Wake:
+            def compute(self):
+                with frames.lock:
+                    return True if any(frames.pending.values()) else None
+
+        return Wake()
 
 
 class Deliver:
-    def __init__(self, callback):
-        self.callback, self.frames = callback, 0
+    """Hand every waiting frame to the callback, in order.
 
-    def compute(self, value):
-        self.callback(value)
-        self.frames += 1
+    The graph edge into this stage keeps one message and may drop an older one, so
+    it only carries a wake-up; the frames themselves stay in ``frames`` until read.
+    """
+
+    def __init__(self, callback, frames):
+        self.callback, self.source, self.frames = callback, frames, 0
+
+    def compute(self, _):
+        while (value := self.source.compute()) is not None:
+            self.callback(value)
+            self.frames += 1
 
 
 class VideoBridge:
-    """Independent latest-frame graph, so browser delivery cannot block robot calls."""
+    """Independent graph, so browser delivery cannot block robot calls."""
 
     def __init__(self, callback):
-        self.source, self.sink = Frames(), Deliver(callback)
+        self.source = Frames()
+        self.sink = Deliver(callback, self.source)
         self.session = ApplicationSession(
-            backend("pipeline").build("surgeon_video", [self.source, self.sink], 1000)
+            backend("pipeline").build("surgeon_video", [self.source.wake, self.sink], 1000)
         )
 
     def start(self):
         self.session.__enter__()
 
     def put(self, camera, header, payload, timing=None):
-        self.source.put(camera, (camera, header, payload, timing))
+        self.source.put(camera, (camera, header, payload, timing), header.get("keyframe", True))
 
     def close(self):
         self.session.__exit__(None, None, None)

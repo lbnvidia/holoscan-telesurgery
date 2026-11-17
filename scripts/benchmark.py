@@ -14,6 +14,8 @@ from pathlib import Path
 
 import aiohttp
 from telesurgery_core.diagnostics.benchmark import write_report
+from telesurgery_core.video.config import Config
+from telesurgery_core.video.encoder_settings import parse_extra, validate
 
 
 class Dashboard:
@@ -92,8 +94,11 @@ async def run(args):
             "codec": args.codec,
             "fps": args.fps,
             "pixel_format": args.pixel_format,
-            "qp": 24,
-            "encoder_preset": "P1",
+            "rate_control": args.rate_control,
+            "bitrate_mbps": args.bitrate,
+            "qp": args.qp,
+            "encoder_preset": args.preset,
+            "encoder_extra": args.encoder_extra,
             "jpeg_quality": 85,
         },
         "sampling": "Timed collection after warmup; actual valid counts are recorded",
@@ -251,11 +256,26 @@ def main():
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--pixel-format", default="")
     parser.add_argument("--codec", choices=["h264", "h265", "nvjpeg", "raw-bgr8"], default="h264")
+    parser.add_argument(
+        "--rate-control", choices=["cbr", "vbr", "cqp"], default=Config.rate_control
+    )
+    parser.add_argument(
+        "--bitrate", type=float, default=Config.bitrate_mbps, help="Mbps; 0 picks one for the size"
+    )
+    parser.add_argument("--qp", type=int, default=Config.qp)
+    parser.add_argument("--preset", choices=["P1", "P3", "P5"], default=Config.encoder_preset)
+    parser.add_argument("--encoder-extra", default="", help="key=value lines, e.g. 'aq=8'")
     parser.add_argument("--receiver", choices=["holoviz", "webrtc"], default="holoviz")
     parser.add_argument("--seconds", type=float, default=60)
     parser.add_argument("--warmup", type=float, default=30)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    try:
+        # Reject bad encoder settings before any stream is stopped or restarted.
+        validate(args.rate_control, args.bitrate, args.qp)
+        parse_extra(args.encoder_extra)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not math.isfinite(args.seconds) or args.seconds < 5:
         parser.error("--seconds must be finite and at least 5")
     if not math.isfinite(args.warmup) or args.warmup < 0:
