@@ -336,6 +336,25 @@ def _encode_moving_noise(config, frames=45):
 
 
 @pytest.mark.parametrize("codec", ["h264", "h265"])
+def test_cbr_initializes_nvenc_in_cbr_mode(codec):
+    import PyNvVideoCodec as nvc
+
+    config = Config(codec=codec, width=640, height=480, fps=30, rate_control="cbr", bitrate_mbps=2)
+    encoder = GpuCodec(config, encode=True)
+    try:
+        pixels = np.zeros((config.height, config.width, 3), dtype=np.uint8)
+        encoder.encode(Frame(VideoHeader(0, 1, config.width, config.height), pixels))
+        params = encoder.backend.GetEncodeReconfigureParams()
+        assert params.rateControlMode == nvc.NV_ENC_PARAMS_RC_MODE.CBR
+        assert params.averageBitrate == 2_000_000
+        frame_budget = round(2_000_000 / config.fps)
+        assert params.vbvBufferSize == frame_budget
+        assert params.vbvInitialDelay == frame_budget
+    finally:
+        encoder.close()
+
+
+@pytest.mark.parametrize("codec", ["h264", "h265"])
 def test_rate_control_modes_and_advanced_settings_change_real_nvenc_output(codec):
     def run(**settings):
         return _encode_moving_noise(Config(codec=codec, width=640, height=480, fps=30, **settings))

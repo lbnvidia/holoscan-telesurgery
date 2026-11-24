@@ -93,7 +93,10 @@ def select(camera, settings=None):
         selected["rate_control"],
         selected["bitrate_mbps"],
         selected["qp"],
-        selected["max_bitrate_mbps"],
+        # Keep the saved max for when the user switches back to NVENC.
+        max_bitrate_mbps=(
+            selected["max_bitrate_mbps"] if selected["codec"] in ("h264", "h265") else 0
+        ),
         automatic_mbps=automatic_bitrate(selected["width"], selected["height"]),
     )
     return selected

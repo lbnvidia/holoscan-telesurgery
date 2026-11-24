@@ -153,6 +153,29 @@ def test_usb_modes_keep_format_specific_frame_rates(monkeypatch):
             select(camera, bad)
 
 
+@pytest.mark.parametrize("codec", ["nvjpeg", "raw-bgr8", "surgical-tokenizer"])
+def test_hidden_vbr_max_does_not_block_a_larger_non_nvenc_stream(codec):
+    camera = {
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "codec": "h264",
+        "codecs": ["h264", codec],
+        "modes": [
+            {"width": 1280, "height": 720, "fps": [30]},
+            {"width": 1920, "height": 1080, "fps": [30]},
+        ],
+    }
+    camera.update(select(camera, {"rate_control": "vbr", "max_bitrate_mbps": 6}))
+    larger = {"width": 1920, "height": 1080}
+    with pytest.raises(ValueError, match="Max bitrate must be at least the average bitrate"):
+        select(camera, larger)
+
+    selected = select(camera, {**larger, "codec": codec})
+    assert (selected["codec"], selected["width"], selected["height"]) == (codec, 1920, 1080)
+    assert selected["max_bitrate_mbps"] == 6
+
+
 def test_only_available_codecs_are_offered_and_probed_once(monkeypatch):
     from telesurgery_core.video import capabilities
 
